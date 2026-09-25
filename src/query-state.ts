@@ -34,6 +34,20 @@ export class QueryContext {
 	/** Highest 5% utilization bucket we notified for, so repeat rate_limit_event spam is suppressed. */
 	lastRateLimitWarnStep: number | null = null;
 	lastRateLimitWarnThreshold: number | undefined;
+	/** pi session this query serves, from SimpleStreamOptions.sessionId at fresh-query
+	 *  setup. A bridge process serves several pi sessions at once (subagents run their
+	 *  own AgentSessions), and history rewrites must only discard the rewriting
+	 *  session's parked queries — this is the match key. Null when the host did not
+	 *  supply an id.
+	 */
+	piSessionId: string | null = null;
+	/** pi rewrote the history this query was built from (session_compact,
+	 *  session_tree in its own pi session). Set by markRebuildForSession, consumed
+	 *  by the tool-result delivery that discards the query. Not session-wide state:
+	 *  it dies with the context it belongs to, so it cannot leak into later turns
+	 *  the way a module flag does.
+	 */
+	historyStale = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;

@@ -11,10 +11,11 @@
  * compactions in one turn with the reported context going *up*, 76,333 → 77,289.
  *
  * The integration test is the one that proves the turn survives; these pin the
- * three things that make it possible, each of which reads as removable on its
- * own: the rewrite is recorded even before any CC session exists, the parked
- * query stops being a routing target, and it cannot reach back and overwrite
- * what replaced it.
+ * three things that make it possible: the rewrite is recorded, attributed to
+ * the pi session that rewrote (a subagent's own AgentSession compacts while the
+ * parent sits parked on the Agent tool result — cross-session marks would kill
+ * the parent's healthy query), the parked query stops being a routing target,
+ * and it cannot reach back and overwrite what replaced it.
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -22,12 +23,13 @@ import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
 const {
-	activeQueryContexts, contextForToolResults, discardRewrittenQuery, getHistoryRewritten,
-	getSharedSession, isQueryAbandoned, markRebuild, resetSharedSession, setSharedSession,
+	activeQueryContexts, armStaleContexts, contextForToolResults, discardRewrittenQuery,
+	historyRewrittenBySession, isQueryAbandoned, markRebuildForSession,
+	getSharedSession, resetSharedSession, setSharedSession,
 } = __test;
 
 /** A query parked mid-turn: CC asked for a tool and is waiting on the answer. */
-function parkedQuery(toolCallId = "call_1") {
+function parkedQuery(toolCallId = "call_1", piSessionId = "pi-parent") {
 	const events = [];
 	const sdkQuery = {
 		interrupt: () => { events.push("interrupt"); return Promise.resolve(); },
@@ -35,6 +37,7 @@ function parkedQuery(toolCallId = "call_1") {
 	};
 	const c = new QueryContext();
 	c.activeQuery = sdkQuery;
+	c.piSessionId = piSessionId;
 	c.turnToolCallIds = [toolCallId];
 	c.pendingToolCalls.set(toolCallId, {
 		toolName: "read",
@@ -50,27 +53,69 @@ const toolResults = [{ toolCallId: "call_1", content: [{ type: "text", text: "fi
 beforeEach(() => {
 	resetSharedSession();
 	activeQueryContexts.clear();
+	historyRewrittenBySession.clear();
 });
 
-describe("markRebuild", () => {
+describe("markRebuildForSession", () => {
 	it("records the rewrite before any Claude Code session exists", () => {
 		// sharedSession is assigned when a query *completes*, so it is null for the
 		// whole of a first turn — and a first turn is long enough to compact.
 		assert.equal(getSharedSession(), null, "precondition: nothing has completed yet");
 
-		markRebuild("session_compact:threshold");
+		markRebuildForSession("pi-parent", "session_compact:threshold");
 
-		assert.equal(getHistoryRewritten(), true,
+		assert.ok(historyRewrittenBySession.has("pi-parent"),
 			"recorded only on the session, the first turn's parked query survives the compaction");
 	});
 
-	it("also forces the next sync down the rebuild path once a session is known", () => {
-		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false });
+	it("arms only the parked queries of the rewriting pi session", () => {
+		const { c } = parkedQuery("call_1", "pi-parent");
+		const sub = parkedQuery("call_sub", "pi-subagent");
 
-		markRebuild("session_tree");
+		markRebuildForSession("pi-parent", "session_compact:threshold");
+		armStaleContexts();
 
-		assert.equal(getHistoryRewritten(), true);
+		assert.equal(c.historyStale, true,
+			"the parent's query really was built from the history pi just rewrote");
+		assert.equal(sub.c.historyStale, false,
+			"the subagent parked inside the parent's tool call — its conversation was never rewritten");
+	});
+
+	it("arms nothing when the rewrite cannot be attributed", () => {
+		const { c } = parkedQuery();
+
+		markRebuildForSession(null, "session_compact:manual");
+		armStaleContexts();
+
+		assert.equal(c.historyStale, false,
+			"conservative: killing a live query on an unattributed rewrite needs proof");
+	});
+
+	it("forces the next sync down the rebuild path for the owning session's conversation", () => {
+		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-a" });
+
+		markRebuildForSession("pi-b", "session_compact:threshold");
+		assert.equal(getSharedSession().needsRebuild, false,
+			"a subagent's compaction must not rebuild the conversation it never touched");
+
+		markRebuildForSession("pi-a", "session_compact:threshold");
 		assert.equal(getSharedSession().needsRebuild, true, "--resume would replay a history pi no longer has");
+
+		markRebuildForSession(null, "session_compact:served");
+		assert.equal(getSharedSession().needsRebuild, true,
+			"an unattributed rewrite is treated as touching whatever is served");
+	});
+
+	it("disconnects the shared CC session from the serving query on a foreign rewrite", () => {
+		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-a" });
+		const { c } = parkedQuery("call_1", "pi-b");
+
+		markRebuildForSession("pi-b", "session_compact:threshold");
+		armStaleContexts();
+
+		assert.equal(c.historyStale, true, "the subagent's own query is genuinely stale");
+		assert.equal(getSharedSession().preserveSharedSession, true,
+			"its next sync routes to an ephemeral session, not the parent's file");
 	});
 });
 
@@ -110,6 +155,21 @@ describe("discardRewrittenQuery", () => {
 
 		assert.equal(isQueryAbandoned(sdkQuery), true,
 			"its completion handler would otherwise capture the stale session id over the rebuilt one");
+	});
+
+	it("consumes the staleness mark for its pi session, leaving siblings armed", () => {
+		const { c } = parkedQuery("call_1", "pi-b");
+		const other = parkedQuery("call_2", "pi-c");
+		markRebuildForSession("pi-c", "session_compact:threshold");
+		markRebuildForSession("pi-b", "session_compact:threshold");
+		armStaleContexts();
+		assert.ok(historyRewrittenBySession.has("pi-b"), "precondition: armed");
+
+		discardRewrittenQuery(c);
+
+		assert.equal(historyRewrittenBySession.has("pi-b"), false, "served");
+		assert.ok(historyRewrittenBySession.has("pi-c"), "a sibling pi session's rewrite is not ours to consume");
+		void other;
 	});
 
 	it("rotates the session id, because the rebuild follows the kill immediately", () => {
