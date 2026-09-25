@@ -790,17 +790,6 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
 	}
-	// A foreign pi session's rewrite (session_compact in a subagent sharing this
-	// process) disconnected the conversation: its rebuild is defensive — without
-	// it, an incoming history-length match could REUSE the foreign session and
-	// deliver the subagent's turn into the parent's CC file. Runs after the
-	// Case-1-synthetic guard and before REBUILD decides preservation, so
-	// preserveId stays false and the foreign file is left alone.
-	if (sharedSession?.preserveSharedSession && sharedSession.piSessionId !== undefined
-		&& piSessionId != null && sharedSession.piSessionId !== piSessionId) {
-		debug(`sync: foreign pi session ${piSessionId.slice(0, 8)} disconnected from session ${sharedSession.sessionId.slice(0, 8)} — ephemeral rebuild`);
-		return { sessionId: null, preserveSharedSession: true };
-	}
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
@@ -834,7 +823,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -1684,8 +1673,10 @@ function discardRewrittenQuery(c: QueryContext): void {
 	try { discarded?.close?.(); } catch {}
 	// The CLI we just killed may still flush a record into the session JSONL, and
 	// the rebuild is the next thing that happens — so rotate rather than race it,
-	// exactly as after an abort.
-	if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+	// exactly as after an abort. Unattributed sharedSession stays conservative:
+	// we cannot prove the discarding query's session doesn't own it.
+	const ownsSharedSession = sharedSession?.piSessionId === undefined || sharedSession.piSessionId === c.piSessionId;
+	if (sharedSession && ownsSharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 	if (c.piSessionId) historyRewrittenBySession.delete(c.piSessionId);
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
@@ -1832,6 +1823,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
 	queryCtx.piSessionId = options?.sessionId ?? null;
+	// A discarded query's replacement reuses this context; without the reset its
+	// first tool result would sit on armed staleness again (the mark is consumed
+	// from the set, not from here) and re-discard a healthy query.
+	queryCtx.historyStale = false;
 
 	const cwd = process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
@@ -2003,7 +1998,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				// Ownership-gated: a foreign session's query aborting says nothing about
+				// this conversation (unattributed stays conservative and rotates).
+				if (sharedSession && (sharedSession.piSessionId === undefined || sharedSession.piSessionId === queryCtx.piSessionId)) {
+					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				}
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
@@ -2024,11 +2023,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
 				}
+				// This was a query disconnected from another session's conversation
+				// (foreign rewrite). Its ending also ends the disconnect — otherwise
+				// every later foreign turn would keep starting and deleting ephemeral
+				// sessions while the owner idles, never reusing anything.
+				if (sharedSession?.preserveSharedSession) {
+					sharedSession = { ...sharedSession, preserveSharedSession: undefined };
+				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd };
+				sharedSession = { sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined };
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2044,9 +2050,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				return;
 			}
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				if (sharedSession.piSessionId === undefined || sharedSession.piSessionId === queryCtx.piSessionId) {
+					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				}
 			} else {
-				sharedSession = null;
+				// A foreign query's failure must not null out the owner's conversation:
+				// the owner keeps its resumable session and rebuilds on its next turn.
+				if (!(sharedSession?.piSessionId !== undefined && sharedSession.piSessionId !== queryCtx.piSessionId)) {
+					sharedSession = null;
+				}
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {

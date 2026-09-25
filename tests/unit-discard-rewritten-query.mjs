@@ -119,6 +119,53 @@ describe("markRebuildForSession", () => {
 	});
 });
 
+describe("foreign session teardown", () => {
+	const ownerSession = () => setSharedSession({ sessionId: "parent", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-parent" });
+
+	it("a foreign discard leaves the owner's conversation alone", () => {
+		ownerSession();
+		const { c } = parkedQuery("call_1", "pi-child");
+		markRebuildForSession("pi-child", "session_compact:threshold");
+		armStaleContexts();
+
+		discardRewrittenQuery(c);
+
+		const s = getSharedSession();
+		assert.equal(s.needsRebuild, false, "the child's rebuild must not force the parent's next sync");
+		assert.equal(s.forceRotate, undefined, "nor rotate it: the parent conversation is intact");
+	});
+
+	it("an unattributed sharedSession still rotates on discard (conservative)", () => {
+		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp" });
+		const { c } = parkedQuery("call_1", "pi-child");
+
+		discardRewrittenQuery(c);
+
+		assert.equal(getSharedSession().forceRotate, true);
+	});
+
+	it("a second genuine rewrite re-arms the discarded context's replacement (mid-turn double compaction)", () => {
+		// The set key was consumed by the first discard; a second compaction in
+		// the same turn re-adds it and must arm the replacement query too — the
+		// replacement's reset (streamClaudeAgentSdk fresh-query setup) only clears
+		// staleness carried over from the query it replaced, not new marks.
+		const { c } = parkedQuery("call_1", "pi-parent");
+		markRebuildForSession("pi-parent", "session_compact:threshold");
+		armStaleContexts();
+		discardRewrittenQuery(c);
+		assert.equal(c.historyStale, true, "the discard's own query is stale by construction");
+
+		const replacement = parkedQuery("call_2", "pi-parent");
+		markRebuildForSession("pi-parent", "session_compact:threshold");
+		armStaleContexts();
+
+		assert.equal(replacement.c.historyStale, true,
+			"a history rewritten under the replacement's predecessor makes this one stale too");
+		discardRewrittenQuery(replacement.c);
+		assert.equal(historyRewrittenBySession.has("pi-parent"), false, "and consumes the mark again");
+	});
+});
+
 describe("discardRewrittenQuery", () => {
 	it("stops the parked query being a routing target for the turn's result", () => {
 		const { c } = parkedQuery();
