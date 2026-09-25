@@ -1672,7 +1672,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
 	// The query is gone but pi still delivered the result. Nothing to do — just
-	// emit end_turn so pi waits for the next real user message.
+	// emit end_turn so pi waits for the next real user message. The discard
+	// branch above already siphoned off the stale-query case, which goes on to a
+	// rebuild instead — that one has somewhere to deliver the result to.
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
@@ -1894,6 +1896,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				return;
 			}
 
+			// This run is over either way (aborted or not), so any rewrite it may
+			// have continued past has been consumed: the only query that could be
+			// discarded on the flag's behalf before the next provider call is a
+			// fresh one, and starting one clears the flag itself. Clearing here
+			// keeps a rewrite re-armed late in a run (a second compaction after the
+			// continuation query was already underway) from outliving the run and
+			// discarding the first parked query of an unrelated later turn — which
+			// would also reroute an abort's orphaned result into a fresh-query
+			// rebuild below. Reentrant completions skip this: a subagent ending
+			// says nothing about whether its parent's history was rewritten.
+			if (!isReentrant) historyRewritten = false;
+
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
 				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
@@ -1936,6 +1950,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				debug("provider: discarded query ended in error, leaving session and stream to its replacement");
 				return;
 			}
+			// Run over in error — same historyRewritten reasoning as the completed path.
+			if (!isReentrant) historyRewritten = false;
+
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 			} else {
