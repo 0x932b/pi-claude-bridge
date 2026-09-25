@@ -208,9 +208,6 @@ interface SessionState {
 	// When this flag is set, REBUILD takes a fresh UUID and skips deleteSession
 	// so the orphan writes land on a dead inode. A compact or tree navigation
 	// with no query in flight does NOT set this — there's no concurrent CC writer
-	preserveSharedSession?: boolean;
-	// Kept when a foreign pi session's rewrite disconnects this session (see
-	// markRebuildForSession): its rebuild must not rewrite or resume the file.
 	// then, so in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
 }
@@ -236,7 +233,34 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 	}
 }
 
-let sharedSession: SessionState | null = null;
+/** The session key a pi session's provider calls address. Unattributed calls
+ *  (no options.sessionId — AskClaude's direct sync, or a host that omits it)
+ *  share the "(none)" bucket: they cannot be told apart, so they share the
+ *  pre-existing single-slot semantics. */
+function sessionKey(piSessionId: string | null | undefined): string {
+	return piSessionId ?? "(none)";
+}
+
+/** Mirror of the CC conversation one pi session's turns are running on. One
+ *  entry per pi session: a bridge process serves several sessions at once
+ *  (pi-subagents children run their own AgentSessions), and a single shared
+ *  slot forced them to fight over it — a length-matching foreign sync could
+ *  REUSE or rebuild another session's CC file, and the completion capture was
+ *  last-writer-wins (a foreground child in the parent's first turn permanently
+ *  reassigned the parent's conversation). Keyed lookup removes the fight: each
+ *  session's reads, writes and teardown marks touch only its own mirror. */
+const sharedSessions = new Map<string, SessionState>();
+
+/** The mirror for `piSessionId`, or null when this session has none yet. */
+function sessionStateFor(piSessionId: string | null | undefined): SessionState | null {
+	return sharedSessions.get(sessionKey(piSessionId)) ?? null;
+}
+
+/** Replace (or plant) the mirror for `piSessionId`. */
+function setSessionStateFor(piSessionId: string | null | undefined, state: SessionState | null): void {
+	if (state === null) sharedSessions.delete(sessionKey(piSessionId));
+	else sharedSessions.set(sessionKey(piSessionId), state);
+}
 
 // pi replaced one of its sessions' history (compact, tree) rather than appending
 // to it. Read on the tool-result path — the one provider call that never reaches
@@ -261,31 +285,22 @@ const markRebuildHooks: Set<MarkRebuildHook> =
 (globalThis as Record<symbol, unknown>)[MARK_REBUILD_HOOKS_KEY] = markRebuildHooks;
 
 /** pi mutated its messages array out from under us: force the next
- *  syncSharedSession down REBUILD, and arm the discard above. `piSession` is
- *  never null from an event handler (each pi session has its own runner); the
- *  "(none)" key covers direct callers with no known pi session, so a served
- *  rewrite still forces the REBUILD side. */
+ *  syncSharedSession down REBUILD, and arm the discard above. `piSession`
+ *  is never null from an event handler (each pi session has its own runner);
+ *  the "(none)" key covers direct callers with no known pi session, so a
+ *  served rewrite still forces the REBUILD side. */
 function markRebuildForSession(piSession: string | null, event: string): void {
-	const key = piSession ?? "(none)";
+	const key = sessionKey(piSession);
 	historyRewrittenBySession.add(key);
-	if (!sharedSession) {
+	// The rewriting session's own mirror: the rewrite changed the history it was
+	// built from, so its next sync must REBUILD rather than REUSE. Every other
+	// session's mirror stays untouched — its conversation was never rewritten.
+	const state = sharedSessions.get(key);
+	if (!state) {
 		debug(`${event}: history rewritten, no session to mark yet`);
-	} else if (piSession === null || sharedSession.piSessionId === undefined || sharedSession.piSessionId === piSession) {
-		// The serving session's own rewrite — or an unattributable one (direct
-		// caller, or a sharedSession predating owner recording). The rewrite may
-		// touch this conversation, so force REBUILD.
-		sharedSession = { ...sharedSession, needsRebuild: true };
-		debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
 	} else {
-		// A foreign pi session (a subagent sharing this process) rewrote its own
-		// history. This conversation is intact — no rebuild — but the foreign
-		// session's next sync would otherwise REUSE or Case-4-rebuild the owner's
-		// CC session (a same-length continuation rebuilds the owner's file in
-		// place). Disconnect it for the length of that query: it gets ephemeral
-		// sessions until its completion clears the mark (see syncSharedSession's
-		// head and the completion's preserveSharedSession branch).
-		sharedSession = { ...sharedSession, preserveSharedSession: true };
-		debug(`${event}: history rewritten in pi session ${piSession.slice(0, 8)}, shared CC session belongs elsewhere — disconnecting`);
+		sharedSessions.set(key, { ...state, needsRebuild: true });
+		debug(`${event}: marking needsRebuild on session ${state.sessionId.slice(0, 8)}`);
 	}
 	// Arming parked contexts cannot wait for delivery: the entry checks
 	// `resultCtx.historyStale`, and a rewrite usually lands *while* the query is
@@ -736,18 +751,11 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// System messages are pi's transcript representation of prompt and tool state, not
 	// conversation history — they are never imported into a CC session, so exclude them from
 	// the history space (priorMessages, cursor, missed) everywhere below (issue #106).
-	// A foreign pi session's rewrite (a subagent compacting while sharing this
-	// process) disconnected the conversation for the length of that query:
-	// route the sync to an ephemeral session instead of REUSE-ing the owner's
-	// file or rebuilding it in place. Cleared when the disconnecting query is
-	// reentrant (it ends with preserveSharedSession, in the completion handler)
-	// — non-reentrant queries are the owner's own, and their REBUILD below
-	// rewrites sharedSession wholesale, dropping the mark with the old state.
-	if (sharedSession?.preserveSharedSession && sharedSession.piSessionId !== undefined
-		&& piSessionId != null && sharedSession.piSessionId !== piSessionId) {
-		debug(`sync: foreign pi session ${piSessionId.slice(0, 8)} disconnected from session ${sharedSession.sessionId.slice(0, 8)} — ephemeral rebuild`);
-		return { sessionId: null, preserveSharedSession: true };
-	}
+	// The mirror this sync coordinates belongs to the syncing pi session alone:
+	// every read and write below addresses sessionStateFor(piSessionId), so a
+	// foreign session's shape-matching context can never REUSE or rebuild another
+	// session's CC file.
+	const sharedSession = sessionStateFor(piSessionId);
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
@@ -763,21 +771,25 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
-			if (trailingAssistantOnly) {
-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
-			}
-			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId };
+		if (trailingAssistantOnly) {
+			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd });
+			debug(`Case 3: advanced cursor past trailing assistant, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${priorMessages.length}`);
+		} else {
+			debug(`Case 3: resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+		}
+		debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession?.cursor}`);
+		return { sessionId: sharedSession.sessionId };
 		}
 	}
-	// This is what keeps a reentrant subagent from taking over the parent's
-	// session: a subagent starts with priors of its own, shorter than the parent's
-	// cursor, so it lands here, gets a fresh session, and the ephemeral session it
-	// captures is deleted once its query completes (see preserveSharedSession in
-	// the completion handler). Remove this branch and a subagent resumes — then
-	// overwrites — the parent's session. The non-isolated AskClaude path reaches it
-	// the same way.
+	// This is what keeps a caller with a pruned or short context from resuming
+	// — then overwriting — the bucket's session: shorter-than-cursor means the
+	// incoming history cannot be a continuation, so start clean and preserve.
+	// Historically this also caught reentrant subagents (a subagent's priors are
+	// shorter than the parent's cursor); with per-session mirrors it now catches
+	// the pruned-context shapes on a session's own bucket, and the non-isolated
+	// AskClaude path on the "(none)" bucket. The captured ephemeral session is
+	// deleted once its query completes (see preserveSharedSession in the
+	// completion handler).
 	//
 	// It is NOT, despite an earlier comment here, the isolated compact-summary
 	// path: runIsolatedSummary never calls syncSharedSession at all.
@@ -802,10 +814,8 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped when there's a concurrent
-	// writer we shouldn't race (forceRotate) and when the session was
-	// disconnected by a foreign pi session's rewrite (its file is not ours to
-	// wipe, and a preserved UUID would resume the wrong conversation).
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate && !sharedSession?.preserveSharedSession;
+	// writer we shouldn't race (forceRotate).
+	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
 	// Before deleteSession — it wipes the file these live in.
 	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
 	if (preserveId) {
@@ -823,7 +833,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined };
+	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -837,10 +847,20 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
+// The SDK's query(), or a test double (see setQuery). The compact/summary
+// path calls the real query() directly — its subprocess must never be swapped
+// out from under a real compaction.
+let queryImpl: typeof query = query;
+
 // @internal
 export const __test = {
-	resetSharedSession() {
-		sharedSession = null;
+	setQuery(fn: typeof query | null) {
+		queryImpl = fn ?? query;
+	},
+	resetSharedSession(piSessionId?: string | null) {
+		// No id: full reset (the pre-map semantics — tests start from a blank slate).
+		if (piSessionId === undefined) sharedSessions.clear();
+		else setSessionStateFor(piSessionId, null);
 		historyRewrittenBySession.clear();
 	},
 	markRebuildForSession,
@@ -853,11 +873,11 @@ export const __test = {
 	get activeQueryContexts() {
 		return activeQueryContexts;
 	},
-	setSharedSession(state: SessionState | null) {
-		sharedSession = state;
+	setSharedSession(piSessionId: string | null, state: SessionState | null) {
+		setSessionStateFor(piSessionId, state);
 	},
-	getSharedSession() {
-		return sharedSession;
+	getSharedSession(piSessionId: string | null = null) {
+		return sessionStateFor(piSessionId);
 	},
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
@@ -1549,9 +1569,10 @@ function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null 
 /** A steer that never made it into CC's session. The cursor has already counted
  *  it, so count-based sync would skip it forever — rebuild instead, which
  *  re-imports the message from pi's context. */
-function steerMissedSession(text: string): void {
-	if (!sharedSession) return;
-	sharedSession = { ...sharedSession, needsRebuild: true };
+function steerMissedSession(piSessionId: string | null, text: string): void {
+	const state = sessionStateFor(piSessionId);
+	if (!state) return;
+	setSessionStateFor(piSessionId, { ...state, needsRebuild: true });
 	debug(`provider: steer never reached CC, marked session for rebuild: ${text.slice(0, 60)}`);
 }
 
@@ -1578,7 +1599,7 @@ async function deliverToolResults(
 		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
 		if (!c.promptStream) {
 			debug(`WARNING: steer with no prompt stream, dropping: ${text.slice(0, 60)}`);
-			steerMissedSession(text);
+			steerMissedSession(c.piSessionId, text);
 		} else {
 			try {
 				await c.promptStream.push(userMessage(steer, "next"));
@@ -1589,7 +1610,7 @@ async function deliverToolResults(
 				// pi's context, and the caller has already advanced the session
 				// cursor past it, so force a rebuild or CC would never see it.
 				debug(`provider: steer push rejected, delivering tool result anyway:`, error);
-				steerMissedSession(text);
+				steerMissedSession(c.piSessionId, text);
 			}
 		}
 	}
@@ -1673,10 +1694,10 @@ function discardRewrittenQuery(c: QueryContext): void {
 	try { discarded?.close?.(); } catch {}
 	// The CLI we just killed may still flush a record into the session JSONL, and
 	// the rebuild is the next thing that happens — so rotate rather than race it,
-	// exactly as after an abort. Unattributed sharedSession stays conservative:
-	// we cannot prove the discarding query's session doesn't own it.
-	const ownsSharedSession = sharedSession?.piSessionId === undefined || sharedSession.piSessionId === c.piSessionId;
-	if (sharedSession && ownsSharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+	// exactly as after an abort. Only this session's mirror: the discarding query
+	// proves its own conversation is the one being rebuilt around.
+	const state = sessionStateFor(c.piSessionId);
+	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 	if (c.piSessionId) historyRewrittenBySession.delete(c.piSessionId);
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
@@ -1754,7 +1775,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
 		// turn a full rebuild and a flushed prompt cache.
-		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
+		const state = sessionStateFor(resultCtx.piSessionId);
+		if (state) state.cursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1767,7 +1789,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession && activeQueryContexts.size === 0) sharedSession.cursor = context.messages.length;
+		// With no query in flight anywhere, the top-level session this result
+		// belongs to is the one whose turn just ended: its cursor advances to
+		// count the result (options.sessionId is that session — pi emits the
+		// result event through the same session's streamSimple call).
+		const orphanState = sessionStateFor(options?.sessionId ?? null);
+		if (orphanState && activeQueryContexts.size === 0) orphanState.cursor = context.messages.length;
 		// No query owns this result, so there is no context to reset: resetTurnState
 		// on the top-level ctx() would replace a live parent's turnOutput mid-stream,
 		// stranding the blocks it had already emitted. A throwaway context just
@@ -1862,7 +1889,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			isReentrant,
 			activeQueryContexts: activeQueryContexts.size,
 			activeQueryExists: queryCtx.activeQuery !== null,
-			sharedSession: sharedSession ? { sessionId: sharedSession.sessionId.slice(0, 8), cursor: sharedSession.cursor } : null,
+			sharedSession: sessionStateFor(piSessionId) ? { sessionId: sessionStateFor(piSessionId)!.sessionId.slice(0, 8), cursor: sessionStateFor(piSessionId)!.cursor } : (sessionStateFor(null) ? { sessionId: sessionStateFor(null)!.sessionId.slice(0, 8), cursor: sessionStateFor(null)!.cursor } : null),
 			messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
 		});
 		// Recover: use a continuation prompt so the SDK doesn't send an empty text block
@@ -1960,7 +1987,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const sdkQuery = query({ prompt: promptStream.stream, options: queryOptions });
+	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -1998,11 +2025,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				// Ownership-gated: a foreign session's query aborting says nothing about
-				// this conversation (unattributed stays conservative and rotates).
-				if (sharedSession && (sharedSession.piSessionId === undefined || sharedSession.piSessionId === queryCtx.piSessionId)) {
-					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				}
+				// The killed subprocess may flush a late record into this session's
+				// JSONL — its own mirror's next sync must rebuild and rotate.
+				const state = sessionStateFor(queryCtx.piSessionId);
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
@@ -2017,24 +2043,23 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 			// --- Capture session ID ---
-			const sessionId = capturedSessionId ?? sharedSession?.sessionId;
+			// This query's own mirror — a reentrant subagent completing does not
+			// reassign the parent's conversation to the child's CC file.
 			if (syncResult.preserveSharedSession) {
-				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
+				const state = sessionStateFor(queryCtx.piSessionId);
+				if (capturedSessionId && capturedSessionId !== state?.sessionId) {
 					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
 				}
-				// This was a query disconnected from another session's conversation
-				// (foreign rewrite). Its ending also ends the disconnect — otherwise
-				// every later foreign turn would keep starting and deleting ephemeral
-				// sessions while the owner idles, never reusing anything.
-				if (sharedSession?.preserveSharedSession) {
-					sharedSession = { ...sharedSession, preserveSharedSession: undefined };
-				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
-			} else if (sessionId) {
-				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
-				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined };
+			} else {
+				const state = sessionStateFor(queryCtx.piSessionId);
+				const sessionId = capturedSessionId ?? state?.sessionId;
+				if (sessionId) {
+					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
+					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
+					setSessionStateFor(queryCtx.piSessionId, { sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined });
+				}
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2049,16 +2074,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				debug("provider: discarded query ended in error, leaving session and stream to its replacement");
 				return;
 			}
-			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				if (sharedSession.piSessionId === undefined || sharedSession.piSessionId === queryCtx.piSessionId) {
-					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				}
+			if ((wasAborted || options?.signal?.aborted)) {
+				const state = sessionStateFor(queryCtx.piSessionId);
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 			} else {
-				// A foreign query's failure must not null out the owner's conversation:
-				// the owner keeps its resumable session and rebuilds on its next turn.
-				if (!(sharedSession?.piSessionId !== undefined && sharedSession.piSessionId !== queryCtx.piSessionId)) {
-					sharedSession = null;
-				}
+				// Drop this session's mirror: its conversation is in an unknown
+				// state after the error. Other sessions' mirrors stay — one
+				// session's failure says nothing about another's conversation.
+				setSessionStateFor(queryCtx.piSessionId, null);
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {
@@ -2117,6 +2140,9 @@ async function promptAndWait(
 		thinking?: string;
 		isolated?: boolean;
 		context?: Context["messages"];
+		/** pi session the calling tool ran in — AskClaude's conversation continues
+	 *  the session that called it, so its sync and capture key that mirror. */
+		piSessionId?: string | null;
 	},
 ): Promise<{ responseText: string; stopReason: string }> {
 	const cwd = process.cwd();
@@ -2127,18 +2153,23 @@ async function promptAndWait(
 
 	// Session resume for shared mode — reuse provider's session if it exists,
 	// otherwise create one from pi's context.
-	// Note: doesn't update sharedSession.cursor after completion, so the next
+	// Note: doesn't update the mirror's cursor after completion, so the next
 	// provider call will see missed messages and trigger a Case 4 rebuild.
+	// AskClaude has a random-origin context handed to it, but the session it
+	// belongs to is the one whose tool ran — the extension API's execute ctx
+	// carries it — passed here as piSessionId and used for every map access.
+	const askClaudeSessionId = options?.piSessionId ?? null;
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession) {
+		const askClaudeState = sessionStateFor(askClaudeSessionId);
+		if (askClaudeState) {
 			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
-			resumeSessionId = sharedSession.sessionId;
+			resumeSessionId = askClaudeState.sessionId;
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel, null);
+			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel, askClaudeSessionId);
 			resumeSessionId = sync.sessionId;
 		}
 	}
@@ -2326,8 +2357,11 @@ export default function (pi: ExtensionAPI) {
 
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
-		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
-		sharedSession = null;
+		debug(`${event}: clearing ${sharedSessions.size} shared session${sharedSessions.size === 1 ? "" : "s"}`);
+		// Whole map: children never emit session_shutdown (only runtime teardown
+		// and /reload do), so there is no per-entry removal to do here — the
+		// top-level transition takes every mirror with it.
+		sharedSessions.clear();
 		historyRewrittenBySession.clear();
 
 		// Clear the global streamSimple if this instance registered it.
@@ -2630,6 +2664,7 @@ export default function (pi: ExtensionAPI) {
 						thinking: params.thinking,
 						isolated,
 						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
+						piSessionId: ctx.sessionManager.getSessionId(),
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });

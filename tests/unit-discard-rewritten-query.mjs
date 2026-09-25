@@ -16,6 +16,10 @@
  * parent sits parked on the Agent tool result — cross-session marks would kill
  * the parent's healthy query), the parked query stops being a routing target,
  * and it cannot reach back and overwrite what replaced it.
+ *
+ * Session mirrors are per pi session (a Map keyed by options.sessionId), so
+ * markRebuildForSession arms and discards only the rewriting session's queries,
+ * and its teardown marks touch only that session's mirror.
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -58,9 +62,9 @@ beforeEach(() => {
 
 describe("markRebuildForSession", () => {
 	it("records the rewrite before any Claude Code session exists", () => {
-		// sharedSession is assigned when a query *completes*, so it is null for the
-		// whole of a first turn — and a first turn is long enough to compact.
-		assert.equal(getSharedSession(), null, "precondition: nothing has completed yet");
+		// The mirror is assigned when a query *completes*, so a session can have
+		// none for a whole first turn — and a first turn is long enough to compact.
+		assert.equal(getSharedSession("pi-parent"), null, "precondition: nothing has completed yet");
 
 		markRebuildForSession("pi-parent", "session_compact:threshold");
 
@@ -92,59 +96,24 @@ describe("markRebuildForSession", () => {
 	});
 
 	it("forces the next sync down the rebuild path for the owning session's conversation", () => {
-		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-a" });
+		// Session mirrors are per pi session: parent and subagent each have one.
+		setSharedSession("pi-a", { sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-a" });
+		setSharedSession("pi-b", { sessionId: "def", cursor: 2, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-b" });
 
 		markRebuildForSession("pi-b", "session_compact:threshold");
-		assert.equal(getSharedSession().needsRebuild, false,
+		assert.equal(getSharedSession("pi-a").needsRebuild, false,
 			"a subagent's compaction must not rebuild the conversation it never touched");
-
-		markRebuildForSession("pi-a", "session_compact:threshold");
-		assert.equal(getSharedSession().needsRebuild, true, "--resume would replay a history pi no longer has");
+		assert.equal(getSharedSession("pi-b").needsRebuild, true,
+			"--resume would replay a history pi no longer has");
 
 		markRebuildForSession(null, "session_compact:served");
-		assert.equal(getSharedSession().needsRebuild, true,
-			"an unattributed rewrite is treated as touching whatever is served");
+		// An unattributed rewrite marks the "(none)" bucket — the only mirror a
+		// direct caller without a session id can be serving.
+		assert.equal(getSharedSession("pi-a").needsRebuild, false,
+			"the parent's mirror is untouched by an unattributed rewrite");
 	});
 
-	it("disconnects the shared CC session from the serving query on a foreign rewrite", () => {
-		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-a" });
-		const { c } = parkedQuery("call_1", "pi-b");
-
-		markRebuildForSession("pi-b", "session_compact:threshold");
-		armStaleContexts();
-
-		assert.equal(c.historyStale, true, "the subagent's own query is genuinely stale");
-		assert.equal(getSharedSession().preserveSharedSession, true,
-			"its next sync routes to an ephemeral session, not the parent's file");
-	});
-});
-
-describe("foreign session teardown", () => {
-	const ownerSession = () => setSharedSession({ sessionId: "parent", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-parent" });
-
-	it("a foreign discard leaves the owner's conversation alone", () => {
-		ownerSession();
-		const { c } = parkedQuery("call_1", "pi-child");
-		markRebuildForSession("pi-child", "session_compact:threshold");
-		armStaleContexts();
-
-		discardRewrittenQuery(c);
-
-		const s = getSharedSession();
-		assert.equal(s.needsRebuild, false, "the child's rebuild must not force the parent's next sync");
-		assert.equal(s.forceRotate, undefined, "nor rotate it: the parent conversation is intact");
-	});
-
-	it("an unattributed sharedSession still rotates on discard (conservative)", () => {
-		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp" });
-		const { c } = parkedQuery("call_1", "pi-child");
-
-		discardRewrittenQuery(c);
-
-		assert.equal(getSharedSession().forceRotate, true);
-	});
-
-	it("a second genuine rewrite re-arms the discarded context's replacement (mid-turn double compaction)", () => {
+	it("arms the discarding session's replacement after a second rewrite (mid-turn double compaction)", () => {
 		// The set key was consumed by the first discard; a second compaction in
 		// the same turn re-adds it and must arm the replacement query too — the
 		// replacement's reset (streamClaudeAgentSdk fresh-query setup) only clears
@@ -163,6 +132,7 @@ describe("foreign session teardown", () => {
 			"a history rewritten under the replacement's predecessor makes this one stale too");
 		discardRewrittenQuery(replacement.c);
 		assert.equal(historyRewrittenBySession.has("pi-parent"), false, "and consumes the mark again");
+		void c;
 	});
 });
 
@@ -204,7 +174,7 @@ describe("discardRewrittenQuery", () => {
 			"its completion handler would otherwise capture the stale session id over the rebuilt one");
 	});
 
-	it("consumes the staleness mark for its pi session, leaving siblings armed", () => {
+	it("consumes the mark for its pi session, leaving sibling sessions armed", () => {
 		const { c } = parkedQuery("call_1", "pi-b");
 		const other = parkedQuery("call_2", "pi-c");
 		markRebuildForSession("pi-c", "session_compact:threshold");
@@ -219,17 +189,34 @@ describe("discardRewrittenQuery", () => {
 		void other;
 	});
 
-	it("rotates the session id, because the rebuild follows the kill immediately", () => {
-		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp" });
-		const { c } = parkedQuery();
+	it("rotates the session id of the discarding session's own mirror, because the rebuild follows the kill immediately", () => {
+		setSharedSession("pi-parent", { sessionId: "abc", cursor: 3, cwd: "/tmp", piSessionId: "pi-parent" });
+		const { c } = parkedQuery("call_1", "pi-parent");
 
 		discardRewrittenQuery(c);
 
 		// The CLI we just killed may still flush a record into the JSONL, and the
 		// rebuild is the very next thing that happens — the abort path's reasoning,
-		// with the race made tighter.
-		assert.equal(getSharedSession().forceRotate, true);
-		assert.equal(getSharedSession().needsRebuild, true);
+		// with the race made tighter. Another session's mirror is never touched.
+		const s = getSharedSession("pi-parent");
+		assert.equal(s.forceRotate, true);
+		assert.equal(s.needsRebuild, true);
+	});
+
+	it("leaves a foreign session's mirror untouched when the foreign query discards", () => {
+		// pi-b's query parks, pi-b compacts, the discard rotates only pi-b's
+		// mirror — when there is none. The parent's mirror is not pi-b's to rotate.
+		setSharedSession("pi-parent", { sessionId: "parent", cursor: 3, cwd: "/tmp", needsRebuild: false, piSessionId: "pi-parent" });
+		const { c } = parkedQuery("call_1", "pi-b");
+		markRebuildForSession("pi-b", "session_compact:threshold");
+		armStaleContexts();
+
+		discardRewrittenQuery(c);
+
+		const s = getSharedSession("pi-parent");
+		assert.equal(s.needsRebuild, false, "the child's rebuild must not force the parent's next sync");
+		assert.equal(s.forceRotate, undefined, "nor rotate it: the parent conversation is intact");
+		assert.equal(getSharedSession("pi-b"), null, "the child never had a mirror to rotate");
 	});
 
 	it("is safe on a context whose query already ended", () => {
@@ -240,5 +227,28 @@ describe("discardRewrittenQuery", () => {
 
 		assert.equal(c.activeQuery, null);
 		assert.equal(activeQueryContexts.has(c), false);
+	});
+});
+
+describe("per-session mirrors", () => {
+	it("separates the CC conversations of two pi sessions", () => {
+		setSharedSession("pi-a", { sessionId: "cc-a", cursor: 4, cwd: "/tmp", piSessionId: "pi-a" });
+		setSharedSession("pi-b", { sessionId: "cc-b", cursor: 1, cwd: "/tmp", piSessionId: "pi-b" });
+
+		assert.equal(getSharedSession("pi-a").sessionId, "cc-a");
+		assert.equal(getSharedSession("pi-b").sessionId, "cc-b");
+		assert.equal(getSharedSession("pi-c"), null, "a session with no mirror has none");
+
+		resetSharedSession("pi-b");
+		assert.equal(getSharedSession("pi-b"), null, "reset clears only the keyed mirror");
+		assert.equal(getSharedSession("pi-a").sessionId, "cc-a", "a sibling survives the reset");
+	});
+
+	it("shares one bucket for unattributed callers", () => {
+		setSharedSession(null, { sessionId: "cc-none", cursor: 2, cwd: "/tmp", piSessionId: undefined });
+
+		assert.equal(getSharedSession(null).sessionId, "cc-none");
+		assert.equal(getSharedSession("pi-a"), null,
+			"an attributed session never touches the unattributed bucket");
 	});
 });
