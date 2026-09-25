@@ -44,6 +44,10 @@ const CONTEXT_WINDOW = 200_000; // what pi registers for the model above
 const TEST_TIMEOUT = 300_000;
 const PROBE_TIMEOUT = 120_000;
 
+// The green path leans on this model twice: the seed probe calibrates the
+// compaction threshold, and the final `midturn-ok` marker has to survive the
+// summarizer. A different model can shift either — recalibrate before swapping.
+
 // Headroom over one minimal turn. The compacted history (summary + the kept
 // tail) has to land under this and the seeded history above it; the seed below
 // is worth ~25K tokens, so anything in the middle separates them.
