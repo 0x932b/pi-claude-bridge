@@ -29,13 +29,14 @@ Ideas and open questions, ordered by rough priority. Nothing is a commitment.
    14,994 `usage:` lines, so the SDK never supplies the field. Right now it reads
    as a working diagnostic. Delete it or record why it stays.
 
-4. **Fail an int run that logs `BUG:` or an unexpected `WARNING:`.** Those lines
+4. **Per-query rewrite staleness instead of the module flag.** The `historyRewritten` flag behind the issue-#101 discard only works with lifecycle discipline — it is cleared at the discard, after a non-reentrant sync, and on every non-reentrant completion, and each site is a place to miss one. Fold the state into `QueryContext`: `markRebuild` marks every context parked in `activeQueryContexts`, delivery reads `resultCtx.historyStale` and consumes it on the discard. No flag, no `isReentrant` gate, no leak window; a second compaction mid-turn then marks the continuation own parked context, which is exactly the intended semantics. If `session_compact` can be attributed to its session (verify before starting), a run rewrite also stops discarding the parked query of an unrelated run sharing the process — today that costs one wasted kill+rebuild. Tests: `unit-discard-rewritten-query.mjs`, `int-compact-midturn-rebuild.mjs`, `int-session-compact.mjs`.
+5. **Fail an int run that logs `BUG:` or an unexpected `WARNING:`.** Those lines
    mean a real defect and the int suite can emit them while passing -- the
    stuck-handler bug shipped exactly that way. `diag/audit-warnings.mjs` already
    parses them; the gap is that no test consults it. Needs an explicit allowlist
    for the tests that induce one on purpose.
 
-5. **Stop the diag replay harness manufacturing the phantom-tool-call condition.**
+6. **Stop the diag replay harness manufacturing the phantom-tool-call condition.**
    `diag/replay-write-path.mjs` and `diag/lib/write-path.mjs` (also used by
    `unit-convert-determinism`) call the conversion without a populated
    `customToolNameToSdk` map, so pi's `bash` is rebuilt as Claude Code's builtin
@@ -44,12 +45,12 @@ Ideas and open questions, ordered by rough priority. Nothing is a commitment.
    under test. Fix: pass the recorded tool list through to `convertPiMessages`.
    Production is unaffected (verified over 86,652 real pi messages).
 
-6. **Mirror `eli/lifecycle-coverage-gaps.md` into a tracked file** -- the
+7. **Mirror `eli/lifecycle-coverage-gaps.md` into a tracked file** -- the
    QueryContext lifecycle x sync-path coverage map is in a gitignored directory, so
    nobody else gets it. Belongs in `docs/` or as a section of `diag/AUDIT.md`. (The
    provenance rule is already in `AGENTS.md`.)
 
-7. **Surface errors that arrive with no open pi stream.** When a result lands
+8. **Surface errors that arrive with no open pi stream.** When a result lands
    after the turn already ended on a tool call, `consumeQuery` records the error
    (stopReason, errorMessage, log) but there is no open `currentPiStream` to push
    an error event onto, so the user sees a stalled turn rather than "rate limited".
@@ -57,31 +58,31 @@ Ideas and open questions, ordered by rough priority. Nothing is a commitment.
    `tests/unit-error-result.mjs` covers the recording; nothing covers the
    surfacing. This is also the third stall cause behind GitHub #35.
 
-8. **Handler timeout / stall watchdog** -- whether the bridge should give up on an
+9. **Handler timeout / stall watchdog** -- whether the bridge should give up on an
    MCP handler that has waited implausibly long instead of only warning.
 
-9. **Markdown rendering** in expanded tool result view. Currently plain text.
+10. **Markdown rendering** in expanded tool result view. Currently plain text.
    Use `Markdown` from `@earendil-works/pi-tui` with a `MarkdownTheme`.
 
-10. **`/claude config` slash command** for runtime configuration. Currently
+11. **`/claude config` slash command** for runtime configuration. Currently
     requires editing JSON and `/reload`.
 
-11. **`/claude:btw` command** for ephemeral questions: response displayed but
+12. **`/claude:btw` command** for ephemeral questions: response displayed but
     not added to LLM context.
 
-12. **Audit tool parameter mismatches**: The bash timeout default (120s) was added
+13. **Audit tool parameter mismatches**: The bash timeout default (120s) was added
     because pi's bash has no default while Claude Code expects one. Other bridged
     tools may have similar mismatches (units, defaults, optional-vs-required params).
     Compare Claude Code's tool schemas against pi's for read, write, edit, grep, find.
 
-13. **AskUserQuestion pi shim** (main provider only): CC never sees
+14. **AskUserQuestion pi shim** (main provider only): CC never sees
     AskUserQuestion (it's in `DISALLOWED_BUILTIN_TOOLS`), so it can't ask the
     user questions interactively. Port a pi-native version using `ctx.ui.custom()`
     for an option picker with free-text fallback. Not applicable to AskClaude
     subagents (can't interact with user). See `fractary/pi-claude-code`
     `AskUserQuestion.ts` for reference.
 
-14. **PlanMode pi shim** (main provider only): Similarly, EnterPlanMode/
+15. **PlanMode pi shim** (main provider only): Similarly, EnterPlanMode/
     ExitPlanMode are blocked. A pi-native plan mode could use
     `pi.setActiveTools()` to restrict to read-only tools, block destructive bash
     via `tool_call` event, and surface plan approval through pi's TUI. Not
