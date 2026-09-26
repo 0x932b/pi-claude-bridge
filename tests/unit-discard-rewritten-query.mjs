@@ -111,6 +111,11 @@ describe("markRebuildForSession", () => {
 		// direct caller without a session id can be serving.
 		assert.equal(getSharedSession("pi-a").needsRebuild, false,
 			"the parent's mirror is untouched by an unattributed rewrite");
+		// The discard set is keyed differently from the mirror on purpose: its
+		// readers all guard on a real piSessionId, so a "(none)" entry here could
+		// never be matched or consumed — only leaked.
+		assert.ok(!historyRewrittenBySession.has("(none)"),
+			"a null mark records no set entry: no reader could match or consume one");
 	});
 
 	it("arms the discarding session's replacement after a second rewrite (mid-turn double compaction)", () => {

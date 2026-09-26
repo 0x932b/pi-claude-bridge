@@ -270,6 +270,11 @@ function setSessionStateFor(piSessionId: string | null | undefined, state: Sessi
 // AgentSessions and can compact mid-run while the parent is parked), and
 // marking across that boundary kills healthy queries (or, worse, rebuilds the
 // parent around a compaction that never touched it).
+//
+// Holds real pi session ids only, never the "(none)" key: no production caller
+// marks with null (the rewrite events attribute via ctx.sessionManager), and
+// every reader guards on a non-null piSessionId — so a "(none)" entry could
+// never be matched or consumed, only leaked.
 const historyRewrittenBySession = new Set<string>();
 
 /** Handlers that arm rewrite staleness, one per module instance. Worktree-
@@ -286,15 +291,15 @@ const markRebuildHooks: Set<MarkRebuildHook> =
 
 /** pi mutated its messages array out from under us: force the next
  *  syncSharedSession down REBUILD, and arm the discard above. `piSession`
- *  is never null from an event handler (each pi session has its own runner);
- *  the "(none)" key covers direct callers with no known pi session, so a
- *  served rewrite still forces the REBUILD side. */
+ *  is never null from an event handler (each pi session has its own runner).
+ *  The "(none)" key still covers the mirror for a hypothetical direct caller
+ *  with no session id, so such a rewrite forces the REBUILD side; the discard
+ *  set holds real ids only — see the comment on historyRewrittenBySession. */
 function markRebuildForSession(piSession: string | null, event: string): void {
-	const key = sessionKey(piSession);
-	historyRewrittenBySession.add(key);
 	// The rewriting session's own mirror: the rewrite changed the history it was
 	// built from, so its next sync must REBUILD rather than REUSE. Every other
 	// session's mirror stays untouched — its conversation was never rewritten.
+	const key = sessionKey(piSession);
 	const state = sharedSessions.get(key);
 	if (!state) {
 		debug(`${event}: history rewritten, no session to mark yet`);
@@ -305,6 +310,7 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	// Arming parked contexts cannot wait for delivery: the entry checks
 	// `resultCtx.historyStale`, and a rewrite usually lands *while* the query is
 	// parked (compaction runs inside pi's turn loop, not between provider calls).
+	if (piSession) historyRewrittenBySession.add(piSession);
 	armStaleContexts();
 }
 
