@@ -2,8 +2,8 @@
 // Warning/anomaly inventory for the bridge debug log.
 //
 // The bridge logs a handful of conditions it believes are impossible or broken
-// (`WARNING:`, `BUG:`). Nothing surfaces them — they scroll past in a 23MB file —
-// so this collects them with counts and dates, plus the tool-loop invariants that
+// (`WARNING:`, `BUG:`). The integration suite gates deadlock markers; this
+// collects all warnings with counts and dates, plus the tool-loop invariants that
 // have no WARNING of their own: MCP handlers that waited and were never resolved,
 // and tool results queued for a handler that never claimed them. Both are the
 // deadlock signature.

@@ -30,11 +30,7 @@ Ideas and open questions, ordered by rough priority. Nothing is a commitment.
    as a working diagnostic. Delete it or record why it stays.
 
 4. **Per-query rewrite staleness — done for the serving instance; worktree-spawn instances still mark via the `Symbol.for` hook registry** (`claude-bridge:markRebuildHooks`), which relies on every instance loading the same module. If a future pi loader change makes that unreliable, the hook registry needs to grow into a shared state channel (per-session mark records the serving instance reads). Session id attribution rides on `options.sessionId`, which pi-ai documents as ignorable metadata — verify it stays set on `streamSimple` calls (agent.ts passes `sessionManager.getSessionId()` today).
-5. **Fail an int run that logs `BUG:` or an unexpected `WARNING:`.** Those lines
-   mean a real defect and the int suite can emit them while passing -- the
-   stuck-handler bug shipped exactly that way. `diag/audit-warnings.mjs` already
-   parses them; the gap is that no test consults it. Needs an explicit allowlist
-   for the tests that induce one on purpose.
+5. **Decide which other `WARNING:` lines should fail integration runs.** The suite gates bridge-origin `BUG:` and stranded MCP-handler markers; `diag/audit-warnings.mjs` inventories the remaining warnings. Add a warning only when its meaning and any intentional test cases are pinned.
 
 6. **Stop the diag replay harness manufacturing the phantom-tool-call condition.**
    `diag/replay-write-path.mjs` and `diag/lib/write-path.mjs` (also used by
