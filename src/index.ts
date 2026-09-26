@@ -1575,11 +1575,11 @@ function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null 
 /** A steer that never made it into CC's session. The cursor has already counted
  *  it, so count-based sync would skip it forever — rebuild instead, which
  *  re-imports the message from pi's context. */
-function steerMissedSession(piSessionId: string | null, text: string): void {
-	const state = sessionStateFor(piSessionId);
-	if (!state) return;
-	setSessionStateFor(piSessionId, { ...state, needsRebuild: true });
-	debug(`provider: steer never reached CC, marked session for rebuild: ${text.slice(0, 60)}`);
+function steerMissedSession(c: QueryContext, text: string): void {
+	c.missedSteer = true;
+	const state = sessionStateFor(c.piSessionId);
+	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true });
+	debug(`provider: steer never reached CC, marked query for rebuild: ${text.slice(0, 60)}`);
 }
 
 /** Releases this turn's tool results to their MCP handlers, after first pushing
@@ -1605,7 +1605,7 @@ async function deliverToolResults(
 		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
 		if (!c.promptStream) {
 			debug(`WARNING: steer with no prompt stream, dropping: ${text.slice(0, 60)}`);
-			steerMissedSession(c.piSessionId, text);
+			steerMissedSession(c, text);
 		} else {
 			try {
 				await c.promptStream.push(userMessage(steer, "next"));
@@ -1616,7 +1616,7 @@ async function deliverToolResults(
 				// pi's context, and the caller has already advanced the session
 				// cursor past it, so force a rebuild or CC would never see it.
 				debug(`provider: steer push rejected, delivering tool result anyway:`, error);
-				steerMissedSession(c.piSessionId, text);
+				steerMissedSession(c, text);
 			}
 		}
 	}
@@ -1860,6 +1860,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first tool result would sit on armed staleness again (the mark is consumed
 	// from the set, not from here) and re-discard a healthy query.
 	queryCtx.historyStale = false;
+	queryCtx.missedSteer = false;
 
 	const cwd = process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
@@ -2064,7 +2065,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				if (sessionId) {
 					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
 					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-					setSessionStateFor(queryCtx.piSessionId, { sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined });
+					// A missed steer may precede the first mirror or arrive while this
+					// query is still able to complete. Preserve both rebuild signals.
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
 				}
 			}
 

@@ -48,6 +48,9 @@ export class QueryContext {
 	 *  the way a module flag does.
 	 */
 	historyStale = false;
+	/** A steer never reached CC. A first query has no session mirror yet, so
+	 *  completion must carry this into the mirror it creates. */
+	missedSteer = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;

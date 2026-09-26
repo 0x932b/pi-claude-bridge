@@ -18,7 +18,8 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { getSessionPath } from "cc-session-io";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -155,6 +156,69 @@ describe("cross-session conversation isolation", () => {
 		const childSlot = getSharedSession(C);
 		assert.ok(childSlot && childSlot.sessionId === "cc-C", "the child keeps its own conversation for its next turn");
 		assert.equal(childSlot.piSessionId, C, "tagged with the session that owns it");
+	});
+
+	it("a missed steer survives successful completion and rebuilds the next turn", async () => {
+		const P = "pi-parent";
+		const u1 = user("first"), a1 = say("first answer"), u2 = user("second"), missed = user("missed steer"), a2 = say("second answer"), u3 = user("third");
+		const g = gate();
+
+		scripts.push({ label: "first", steps: [init("cc-missed"), result("first answer")] });
+		await call(P, [u1]).result();
+
+		scripts.push({ label: "second", steps: [init("cc-P2"), g.wait, result("second answer")] });
+		const second = call(P, [u1, a1, u2]);
+		await settle();
+		assert.equal(calls.at(-1).resume, "cc-missed");
+
+		// The CLI has stopped accepting input, but still returns a successful
+		// result. Model the provider's tool-result path counting the steer before
+		// the next turn, so cursor-based sync alone cannot recover it.
+		const context = [...__test.activeQueryContexts].find((c) => c.piSessionId === P);
+		assert.ok(context, "second turn is still active");
+		context.promptStream.fail(new Error("prompt stream closed"));
+		await __test.deliverToolResults(context, [], [{ type: "text", text: "missed steer" }], 4);
+		getSharedSession(P).cursor = 4;
+		context.latestCursor = 4;
+		assert.equal(getSharedSession(P).needsRebuild, true);
+		g.open();
+		await second.result();
+		assert.equal(getSharedSession(P).needsRebuild, true, "completion must not forget the missed steer");
+
+		const rebuiltFile = getSessionPath("cc-missed", process.cwd(), claudeDir);
+		assert.equal(existsSync(rebuiltFile), false, "the fake SDK has not written a session file");
+		scripts.push({ label: "third", steps: [init("cc-P3"), result("third answer")] });
+		await call(P, [u1, a1, u2, missed, a2, u3]).result();
+		assert.equal(existsSync(rebuiltFile), true, "the next turn imports pi history rather than reusing CC's incomplete session");
+		assert.match(readFileSync(rebuiltFile, "utf8"), /missed steer/, "the rebuilt history includes the undelivered steer");
+		assert.ok(!getSharedSession(P).needsRebuild, "the rebuilt turn clears the query's missed-steer mark");
+	});
+
+	it("a missed steer in the first turn rebuilds even without an existing mirror", async () => {
+		const P = "pi-first-miss";
+		const u1 = user("first"), missed = user("missed first-turn steer"), a1 = say("first answer"), u2 = user("second");
+		const g = gate();
+
+		scripts.push({ label: "first", steps: [init("cc-first-missed"), g.wait, result("first answer")] });
+		const first = call(P, [u1]);
+		await settle();
+		assert.equal(getSharedSession(P), null, "clean start has no mirror until completion");
+
+		const context = [...__test.activeQueryContexts].find((c) => c.piSessionId === P);
+		assert.ok(context, "first turn is still active");
+		context.promptStream.fail(new Error("prompt stream closed"));
+		await __test.deliverToolResults(context, [], [{ type: "text", text: "missed first-turn steer" }], 2);
+		context.latestCursor = 2;
+		g.open();
+		await first.result();
+		assert.equal(getSharedSession(P).needsRebuild, true, "completion records the miss despite having no earlier mirror");
+
+		const rebuiltFile = getSessionPath("cc-first-missed", process.cwd(), claudeDir);
+		assert.equal(existsSync(rebuiltFile), false);
+		scripts.push({ label: "second", steps: [init("cc-first-missed"), result("second answer")] });
+		await call(P, [u1, missed, a1, u2]).result();
+		assert.match(readFileSync(rebuiltFile, "utf8"), /missed first-turn steer/);
+		assert.ok(!getSharedSession(P).needsRebuild, "the next query starts without the prior miss");
 	});
 
 	it("a parent error followed by a child turn does not hand the child the parent's conversation", async () => {
