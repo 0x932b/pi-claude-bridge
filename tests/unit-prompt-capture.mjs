@@ -132,6 +132,18 @@ describe("PromptCaptures", () => {
 		assert.equal(diagnostics[0].matches[0].firstDivergent, 14);
 	});
 
+	it("names pi#5581 when a prompt is a recorded key with its tail missing", () => {
+		const captures = new PromptCaptures();
+		// The issue #144 shape: the next turn's prompt is the last recorded key with the
+		// extension's additions gone, because the idle triggerTurn skipped before_agent_start.
+		captures.record(`${PARENT_KEY}\n\n<skills>extension additions</skills>`, capture(), "turn_start");
+
+		assert.throws(
+			() => captures.resolveOrDerive(PARENT_KEY),
+			/pi#5581/,
+		);
+	});
+
 	it("recursively projects an inherited prompt without Pi's harness", () => {
 		const browser = skill("browser");
 		const captures = new PromptCaptures();
