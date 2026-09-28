@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Bump: Claude Sonnet 5.5** — Should appear in `/model` with 1M context once pi-ai ships the new catalog entry. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
+
 ## 0.9.0 — 2026-09-27
 
 - **Bump: require pi ≥0.86.1 and drop pre-0.86 compat** — This breaks support for pi <0.86.1. Use pi-ai's transcript helpers and update dev peers to `^0.87.1` and the Agent SDK to `^0.3.280`; the API now rejects older Claude Code clients.
