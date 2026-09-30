@@ -6,6 +6,7 @@
 - **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
 - **Fix: write the debug and diagnostics logs into pi's agent dir** — Honour `PI_CODING_AGENT_DIR` instead of always writing to (and recreating) `~/.pi/agent`. `CLAUDE_BRIDGE_DEBUG_PATH` still overrides the debug log. Thanks @Susensio (PR #147).
 - **Fix: report an unresolvable or refused system prompt as a failed turn on the stream** — The prompt-capture checks no longer throw out of the provider call, so callers outside pi's agent loop get an error event too. Covered by `tests/unit-prompt-capture-turn-failure.mjs`. Thanks @jmtoepperwien (PR #124).
+- **Fix: thinking tokens never reached pi's `usage.reasoning`** — Read the SDK's nested `output_tokens_details.thinking_tokens`, as pi's own Anthropic provider does. Reasoning stays a subset of output tokens and out of cost. Thanks @cmembreno048 (PR #139).
 
 ## 0.9.0 — 2026-09-27
 
