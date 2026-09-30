@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
 - **Bump: Claude Sonnet 5.5** — Should appear in `/model` with 1M context once pi-ai ships the new catalog entry. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
 
 ## 0.9.0 — 2026-09-27
