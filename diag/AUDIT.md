@@ -18,7 +18,7 @@ node --import tsx diag/audit-warnings.mjs    [claude-bridge.log] [--since YYYY-M
 node --import tsx diag/replay-write-path.mjs <pi-session.jsonl>
 ```
 
-Defaults are `~/.claude/projects` and `~/.pi/agent/claude-bridge.log`.
+Defaults are `~/.claude/projects` and the bridge log in pi's agent dir (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
 
 **`--since` is what makes these gates rather than reports.** Everything found is
 always printed, but the exit code counts only records and log lines inside the

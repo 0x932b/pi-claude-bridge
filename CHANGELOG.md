@@ -4,6 +4,7 @@
 
 - **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — Update pi-ai to get `claude-sonnet-5-5` and set its context to 1M. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
 - **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
+- **Fix: write the debug and diagnostics logs into pi's agent dir** — Honour `PI_CODING_AGENT_DIR` instead of always writing to (and recreating) `~/.pi/agent`. `CLAUDE_BRIDGE_DEBUG_PATH` still overrides the debug log. Thanks @Susensio (PR #147).
 
 ## 0.9.0 — 2026-09-27
 
