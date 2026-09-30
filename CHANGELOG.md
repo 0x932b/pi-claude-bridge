@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — Update pi-ai to get `claude-sonnet-5-5` and set its context to 1M. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
+- **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — Update pi-ai to get `claude-sonnet-5-5` and set its context to 1M. Agent SDK now requires `^0.3.284`; the Claude Code contract tests were last run on 0.3.284 (Claude Code 2.1.284).
 - **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
 - **Fix: write the debug and diagnostics logs into pi's agent dir** — Honour `PI_CODING_AGENT_DIR` instead of always writing to (and recreating) `~/.pi/agent`. `CLAUDE_BRIDGE_DEBUG_PATH` still overrides the debug log. Thanks @Susensio (PR #147).
 - **Fix: report an unresolvable or refused system prompt as a failed turn on the stream** — The prompt-capture checks end the returned stream with an error event instead of throwing out of the provider call, so callers outside pi's agent loop see a failed turn too. The diagnostics log now creates pi's agent dir itself, so writing it can no longer throw in the error's place. PR #124's fallback to the freshest capture is not included: a user-only or steer turn arriving mid-query whose prompt no capture accounts for still fails, now as a failed turn rather than a throw. Covered by `tests/unit-prompt-capture-turn-failure.mjs`. Thanks @jmtoepperwien (PR #124).
