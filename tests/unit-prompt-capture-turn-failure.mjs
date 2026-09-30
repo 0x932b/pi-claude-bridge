@@ -6,15 +6,20 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // The failure path writes a diag entry to pi's agent dir, which the bridge resolves
 // at import time: point it at a throwaway dir so the real diag log is untouched.
-const agentDir = mkdtempSync(join(tmpdir(), "claude-bridge-turn-failure-"));
+// The agent dir itself does not exist yet, so a diag write that cannot create it
+// would throw out of streamSimple instead of failing the turn. Debug stays off: with
+// CLAUDE_BRIDGE_DEBUG=1 the bridge creates the dir at import and hides that throw.
+const tmpRoot = mkdtempSync(join(tmpdir(), "claude-bridge-turn-failure-"));
+const agentDir = join(tmpRoot, "agent");
 process.env.PI_CODING_AGENT_DIR = agentDir;
-process.on("exit", () => rmSync(agentDir, { recursive: true, force: true }));
+delete process.env.CLAUDE_BRIDGE_DEBUG;
+process.on("exit", () => rmSync(tmpRoot, { recursive: true, force: true }));
 
 const { default: activate, __test } = await import("../src/index.js");
 const { PI_PREAMBLE } = await import("../src/prompt-capture.js");
@@ -46,6 +51,7 @@ describe("a prompt the bridge refuses", () => {
 		assert.match(result.errorMessage, /prompt-capture: no capture/);
 		assert.equal(queries, 0);
 		assert.equal(__test.activeQueryContexts.size, 0);
+		assert.ok(existsSync(join(agentDir, "claude-bridge-diag.log")));
 	});
 
 	it("fails the turn on the stream when the sendability guard refuses the capture", async () => {
