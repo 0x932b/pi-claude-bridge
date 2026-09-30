@@ -1,13 +1,13 @@
 # Changelog
 
-## UNRELEASED
+## 0.9.1 — 2026-09-30
 
-- **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — Update pi-ai to get `claude-sonnet-5-5` and set its context to 1M. Agent SDK now requires `^0.3.284`; the Claude Code contract tests were last run on 0.3.284 (Claude Code 2.1.284).
+- **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — pi-ai update brings `claude-sonnet-5-5` with 1M context. Agent SDK now requires `^0.3.284`.
 - **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
-- **Fix: write the debug and diagnostics logs into pi's agent dir** — Honour `PI_CODING_AGENT_DIR` instead of always writing to (and recreating) `~/.pi/agent`. `CLAUDE_BRIDGE_DEBUG_PATH` still overrides the debug log. `diag/audit-cache.mjs` reads its default log from the same place. Thanks @Susensio (PR #147).
-- **Fix: report an unresolvable or refused system prompt as a failed turn on the stream** — The prompt-capture checks end the returned stream with an error event instead of throwing out of the provider call, so callers outside pi's agent loop see a failed turn too. The diagnostics log now creates pi's agent dir itself, so writing it can no longer throw in the error's place. PR #124's fallback to the freshest capture is not included: a user-only or steer turn arriving mid-query whose prompt no capture accounts for still fails, now as a failed turn rather than a throw. Covered by `tests/unit-prompt-capture-turn-failure.mjs`. Thanks @jmtoepperwien (PR #124).
-- **Add: name pi#5581 when an extension-triggered turn's prompt can't be matched (issue #144)** — An idle turn started by an extension's `sendMessage` with `triggerTurn` skips `before_agent_start`, so its prompt lacks that turn's extension additions. The turn still fails, but the error now says so and suggests sending a user message instead of `triggerTurn`.
-- **Fix: thinking tokens never reached pi's `usage.reasoning`** — Read the SDK's nested `output_tokens_details.thinking_tokens`, as pi's own Anthropic provider does. Reasoning stays a subset of output tokens and out of cost. Thanks @cmembreno048 (PR #139).
+- **Fix: write the debug and diagnostics logs into pi's agent dir (#147)** — Honour `PI_CODING_AGENT_DIR` instead of always writing to (and recreating) `~/.pi/agent`; `CLAUDE_BRIDGE_DEBUG_PATH` still overrides the debug log. Thanks @Susensio.
+- **Fix: unresolvable or refused system prompt ends the turn as a stream error (#124)** — The prompt-capture checks end the returned stream with an error event instead of throwing out of the provider call, so callers outside pi's agent loop see a failed turn too. The fallback to the freshest capture proposed in #124 is not included: an unmatched mid-query turn still fails, now as a failed turn rather than a throw. Thanks @jmtoepperwien.
+- **Add: name pi#5581 when an extension-triggered turn's prompt can't be matched (#144)** — An idle `sendMessage` with `triggerTurn` skips `before_agent_start`, so its prompt lacks that turn's extension additions. The turn still fails, but the error now says so and suggests sending a user message instead.
+- **Fix: thinking tokens never reached pi's `usage.reasoning` (#139)** — Read the SDK's nested `output_tokens_details.thinking_tokens`, as pi's own Anthropic provider does. Reasoning stays a subset of output tokens and out of cost. Thanks @cmembreno048.
 
 ## 0.9.0 — 2026-09-27
 
