@@ -2,8 +2,8 @@
 
 ## UNRELEASED
 
+- **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — Update pi-ai to get `claude-sonnet-5-5` and set its context to 1M. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
 - **Tests: add PR CI** — Run unit tests on GitHub Actions without Claude credentials.
-- **Bump: Claude Sonnet 5.5** — Should appear in `/model` with 1M context once pi-ai ships the new catalog entry. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
 
 ## 0.9.0 — 2026-09-27
 
