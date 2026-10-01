@@ -55,17 +55,17 @@ const CC_CHILD_ENV = {
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its
-// own on top: otherwise a project CLAUDE.md arrives twice, and the user's
-// ~/.claude/CLAUDE.md — a persona written for a harness that is not the one
-// running — arrives at all, stamped "These instructions OVERRIDE any default
+// own on top: otherwise project CLAUDE.md/AGENTS.md files arrive twice, and
+// ~/.claude/CLAUDE.md — a user persona written for a harness that is not the
+// one running — arrives at all, stamped "These instructions OVERRIDE any default
 // behavior" and outranking Pi's own AGENTS.md.
 //
 // Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
 // is the same one that reads settings.json, where Bedrock/Vertex users keep
 // `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
-// paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
+// paths; the filename globs cover user, ancestor, project and .claude/ copies,
 // while rules need their own. Managed/policy memory is not excludable by design.
-const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
+const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/AGENTS.md", "**/.claude/rules/**"];
 
 // Ensure the debug log directory exists when debug is enabled
 if (DEBUG) {

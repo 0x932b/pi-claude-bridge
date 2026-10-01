@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: duplicate AGENTS.md instructions (#151)** — Exclude Claude Code's native copy, matching the existing CLAUDE.md exclusions.
+
 ## 0.9.1 — 2026-09-30
 
 - **Bump: Claude Sonnet 5.5 and pi-ai 0.99.1** — pi-ai update brings `claude-sonnet-5-5` with 1M context. Agent SDK now requires `^0.3.284`.
