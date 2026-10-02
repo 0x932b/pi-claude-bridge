@@ -2409,7 +2409,7 @@ export default function (pi: ExtensionAPI) {
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
 	//
-	// The options (custom/append/contextFiles/skills) are pi config, stable across a
+	// The options (custom/append/contextFiles/skills/sections) are pi config, stable across a
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
@@ -2419,6 +2419,7 @@ export default function (pi: ExtensionAPI) {
 		appendSystemPrompt?: string;
 		contextFiles?: { path: string; content: string }[];
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
+		sections?: Record<string, string>;
 		selectedTools?: string[];
 	} | undefined) {
 		if (!systemPrompt) return;
@@ -2428,6 +2429,7 @@ export default function (pi: ExtensionAPI) {
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
+			sections: options?.sections,
 		}, source);
 	}
 	pi.on("before_agent_start", (event) => {

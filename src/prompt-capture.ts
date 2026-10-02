@@ -11,6 +11,10 @@ export type PromptCaptureInput = {
 	append?: string;
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
+	/** Custom prompt sections from `systemPromptOptions.sections`, raw content keyed by
+	 *  section name. pi renders each one as `<name>\ncontent\n</name>` after the built-in
+	 *  sections; the projection does the same. */
+	sections?: Record<string, string>;
 };
 
 type InheritedPrompt = {
@@ -87,6 +91,9 @@ export class PromptCaptures {
 		capture.append = input.append;
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
+		// Copied, not referenced: the caller's systemPromptOptions is a live object that
+		// later before_agent_start handlers mutate.
+		capture.sections = { ...input.sections };
 		capture.source = source;
 		if (!existing || customChanged) {
 			capture.inherited = this.findInheritedPrompts(systemPrompt, input.custom);
@@ -345,6 +352,12 @@ function projectCapture(
 		if (skills) parts.push({ label: "the skills block", text: skills });
 		if (custom) parts.push({ label: "the custom prompt", text: custom });
 		if (capture.append) parts.push({ label: "the appended instructions", text: capture.append });
+		// pi's builder renders custom sections last, after `cwd` — the one built-in section
+		// with nothing portable to forward — so they follow the append here.
+		for (const [name, content] of Object.entries(capture.sections ?? {})) {
+			if (!content) continue;
+			parts.push({ label: `the ${name} section`, text: `<${name}>\n${content}\n</${name}>` });
+		}
 		assertSendablePrompt(parts, capture);
 		return parts.length > 0 ? parts.map((part) => part.text).join("\n\n") : undefined;
 	} finally {
