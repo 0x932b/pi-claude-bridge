@@ -40,6 +40,21 @@ describe("collectCarriedAttachments", () => {
 		assert.equal(carried[0].parentText, "review @a.js");
 	});
 
+	it("keeps session-start context in its original position, so a rebuilt prefix stays cacheable", () => {
+		// Dropped, CC re-attaches these to the NEWEST prompt on the rebuilt session,
+		// so the request differs at messages[0] and the whole history misses the
+		// prompt cache. Carried, they stay on the first prompt as in the live session.
+		const kinds = ["environment", "model", "output_style_instructions", "total_tokens_reminder",
+			"output_style", "session_context", "date", "credential_org"];
+		const records = [user("u1", "first")];
+		let parent = "u1";
+		kinds.forEach((k, i) => { records.push(attach(`c${i}`, parent, k)); parent = `c${i}`; });
+		records.push(attach("snap", parent, "prompt_snapshot"));
+		const carried = collectCarriedAttachments(records);
+		assert.deepEqual(carried.map((c) => c.attachment.type), kinds);
+		assert.ok(carried.every((c) => c.userOrdinal === 0 && c.parentText === "first"));
+	});
+
 	it("ignores an attachment whose parent is not a prompt", () => {
 		const carried = collectCarriedAttachments([
 			user("u1", "first"),
