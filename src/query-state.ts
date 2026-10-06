@@ -20,6 +20,9 @@ export class QueryContext {
 	activeQuery: unknown | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
+	/** The messages the latest tool-result delivery saw (length latestCursor), so
+	 *  completion can fingerprint the history the cursor counts. */
+	latestMessages: readonly { role: string }[] | null = null;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	/** tool_use ids emitted this turn. Sole purpose is routing a delivered result

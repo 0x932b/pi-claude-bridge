@@ -8,6 +8,21 @@ import { MCP_TOOL_PREFIX } from "./skills.js";
 
 export const PROVIDER_ID = "claude-bridge";
 
+/** Timeout (seconds) mapToolArgs adds to a bash call that carried none. */
+export const BASH_DEFAULT_TIMEOUT = 120;
+
+/** A tool call's arguments as Claude sent them. mapToolArgs adds a default bash
+ *  timeout before pi records the call, so pi's copy carries a key Claude never
+ *  wrote; replaying it changes the history's bytes and a rebuild misses the
+ *  prompt cache from the first bash call on. Only for calls this provider made:
+ *  no other provider adds the default. A call where Claude itself chose 120 loses
+ *  the key too, which changes nothing it ran. */
+function claudeToolArgs(name: string, args: Record<string, unknown> | undefined, provider: string | undefined): Record<string, unknown> {
+	if (!args || provider !== PROVIDER_ID || name.toLowerCase() !== "bash" || args.timeout !== BASH_DEFAULT_TIMEOUT) return args ?? {};
+	const { timeout: _added, ...sent } = args;
+	return sent;
+}
+
 // Pi tool names under Claude Code's builtin names. Only ever correct on the
 // AskClaude path, where CC runs its own tools — see mapPiToolNameToSdk.
 export const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
@@ -150,7 +165,7 @@ export function convertPiMessages(
 					}
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
+					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: claudeToolArgs(block.name, block.arguments, msg.provider) });
 				} else {
 					dropped.other.set(block.type, (dropped.other.get(block.type) ?? 0) + 1);
 				}

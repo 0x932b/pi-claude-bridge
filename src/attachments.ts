@@ -37,13 +37,6 @@ const CONTENT_BEARING = new Set(["file"]);
 // prefix (text-identical; one message may switch list/string form, as it does on
 // any live turn) and the history is read from cache: measured 26,417 read / 875
 // written vs 12,722 / 14,423 without, on the same rebuild.
-//
-// `instructions` is the memory/instruction-file block (auto-memory MEMORY.md, and
-// project instruction files when CC loads them). It only exists when the folder has
-// such files, so a test folder without a memory dir never exercises it; dropped, it
-// moves to the newest prompt like the rest. Carrying replays exactly what the model
-// saw at session start. If the file changes mid-session CC appends a fresh copy to
-// a later prompt, as it does in a session that was never rebuilt.
 const SESSION_CONTEXT = new Set([
 	"environment",
 	"model",

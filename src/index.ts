@@ -5,9 +5,10 @@ import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@a
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, realpathSync, statSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+import { randomUUID } from "crypto";
+import { PROVIDER_ID, BASH_DEFAULT_TIMEOUT, messageContentToText, convertPiMessages } from "./convert.js";
 import { DEBUG_LOG_PATH, DIAG_LOG_PATH } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
@@ -23,7 +24,7 @@ import {
 	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
-import { recordSessionLink, lookupSessionLink } from "./session-links.js";
+import { recordSessionLink, lookupSessionLink, lookupResumableLink, historyFingerprint, type HistoryFingerprint } from "./session-links.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
@@ -56,17 +57,17 @@ const CC_CHILD_ENV = {
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its
-// own on top: otherwise project CLAUDE.md/AGENTS.md files arrive twice, and
-// ~/.claude/CLAUDE.md — a user persona written for a harness that is not the
-// one running — arrives at all, stamped "These instructions OVERRIDE any default
+// own on top: otherwise a project CLAUDE.md arrives twice, and the user's
+// ~/.claude/CLAUDE.md — a persona written for a harness that is not the one
+// running — arrives at all, stamped "These instructions OVERRIDE any default
 // behavior" and outranking Pi's own AGENTS.md.
 //
 // Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
 // is the same one that reads settings.json, where Bedrock/Vertex users keep
 // `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
-// paths; the filename globs cover user, ancestor, project and .claude/ copies,
+// paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
 // while rules need their own. Managed/policy memory is not excludable by design.
-const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/AGENTS.md", "**/.claude/rules/**"];
+const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
 // Ensure the debug log directory exists when debug is enabled
 if (DEBUG) {
@@ -213,6 +214,28 @@ interface SessionState {
 	// with no query in flight does NOT set this — there's no concurrent CC writer
 	// then, so in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// The pi history (system messages excluded) the CC file holds, as of the last
+	// point both were known together. Persisted with the session link so a new pi
+	// process can resume the file instead of rebuilding it. Its own count, not
+	// `cursor`: the cursor also moves mid-turn where no fingerprint is taken.
+	fingerprint?: HistoryFingerprint;
+	// Set ONLY by an abort (Esc), with needsRebuild + forceRotate. The CC file the
+	// killed subprocess wrote already holds the aborted turn, ending in CC's own
+	// "[Request interrupted by user]" — exactly what Claude Code continues from
+	// after its own Esc. So the next turn forks that file (resume + forkSession,
+	// a fresh id, so a late orphan write lands in the old file) instead of
+	// rebuilding it from pi's copy, which never byte-matches what CC sent: CC
+	// inserts reminders after every tool result that pi never sees, so a rebuild
+	// misses the prompt cache from the first tool result on. Any other rebuild
+	// reason (compact, tree, a discarded query) clears it: pi's history then no
+	// longer extends the file's.
+	forkAfterAbort?: boolean;
+	// A query on this session's CC file started and pi has not yet persisted its
+	// end: until then the file may hold a turn (or a final reply) pi's history
+	// lacks, so the persisted link is written unresumable. Set at query start,
+	// cleared at agent_end, which pi emits after it has appended the turn's final
+	// message (agent-session: message_end persists before agent_end).
+	turnInFlight?: boolean;
 }
 
 /**
@@ -265,7 +288,7 @@ function setSessionStateFor(piSessionId: string | null | undefined, state: Sessi
 	else {
 		sharedSessions.set(sessionKey(piSessionId), state);
 		// Persisted so a NEW process can still carry attachments (session-links.ts).
-		recordSessionLink(piSessionId, state.sessionId, state.cwd);
+		recordSessionLink(piSessionId, state.sessionId, state.cwd, state.fingerprint, Boolean(state.needsRebuild || state.forceRotate || state.turnInFlight));
 	}
 }
 
@@ -311,7 +334,7 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	if (!state) {
 		debug(`${event}: history rewritten, no session to mark yet`);
 	} else {
-		sharedSessions.set(key, { ...state, needsRebuild: true });
+		sharedSessions.set(key, { ...state, needsRebuild: true, forkAfterAbort: false });
 		debug(`${event}: marking needsRebuild on session ${state.sessionId.slice(0, 8)}`);
 	}
 	// Arming parked contexts cannot wait for delivery: the entry checks
@@ -676,6 +699,14 @@ function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; det
 interface SyncResult {
 	sessionId: string | null;
 	preserveSharedSession?: boolean;
+	/** Open `sessionId` as a fork of this CC session (resume + forkSession). */
+	forkFrom?: string;
+}
+
+/** Query options that open the session a sync chose. */
+function resumeOptions(sync: SyncResult): { resume?: string; forkSession?: boolean; sessionId?: string } {
+	if (sync.forkFrom && sync.sessionId) return { resume: sync.forkFrom, forkSession: true, sessionId: sync.sessionId };
+	return sync.sessionId ? { resume: sync.sessionId } : {};
 }
 
 /**
@@ -703,6 +734,82 @@ function verifyWrittenSession(
 			"warning",
 		);
 		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
+	}
+}
+
+type CcRecord = { type?: string; message?: { id?: string; content?: unknown } };
+
+/** The linked CC session's records, if the file exists, parses and holds any. A
+ *  file that does not would make `--resume` fail the turn; rebuilding is the safe
+ *  fallback. */
+function ccSessionRecords(sessionId: string, cwd: string): ReadonlyArray<CcRecord> | undefined {
+	try {
+		const records = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }).records as unknown as ReadonlyArray<CcRecord>;
+		return records.length > 0 ? records : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function textOf(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return (content as Array<{ type?: string; text?: string }>)
+		.filter((block) => block.type === "text" && block.text).map((block) => block.text).join("\n");
+}
+
+/** The text of the last assistant message in a CC file. CC writes one record per
+ *  content block, sharing the API message id, so the message is every record
+ *  under the last assistant record's id. */
+function lastAssistantText(records: ReadonlyArray<CcRecord>): string {
+	const last = [...records].reverse().find((record) => record.type === "assistant");
+	if (!last) return "";
+	const id = last.message?.id;
+	return records.filter((record) => record.type === "assistant" && (id ? record.message?.id === id : record === last))
+		.map((record) => textOf(record.message?.content)).filter(Boolean).join("\n");
+}
+
+/** The aborted CC session can be forked as-is: it parses, and every tool_use in
+ *  it has its tool_result. On an Esc mid-tool Claude Code writes the rejection
+ *  result itself; a subprocess killed before it could would leave a dangling
+ *  tool_use, which the API rejects on the next turn. Rebuilding (which repairs
+ *  the pairing) is the fallback. */
+// Quiet time a forked file needs: the killed subprocess may still be flushing
+// records (see forceRotate). A write after the tool-pair scan below could leave
+// the fork a dangling tool_use, so a file still changing after this long is
+// rebuilt instead.
+const FORK_QUIET_MS = 1000;
+
+function ccSessionForkable(sessionId: string, cwd: string): boolean {
+	try {
+		const path = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }).jsonlPath;
+		const before = statSync(path).mtimeMs;
+		const age = Date.now() - before;
+		if (age < FORK_QUIET_MS) {
+			// Only when the next prompt follows the abort within the window (Esc, then
+			// a message already typed). This path is synchronous up to the query, so
+			// block for the rest of the window rather than give the cache up.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, FORK_QUIET_MS - age);
+			if (statSync(path).mtimeMs !== before) {
+				debug(`post-abort: session ${sessionId.slice(0, 8)} still being written ${FORK_QUIET_MS}ms after the abort, rebuilding instead of forking`);
+				return false;
+			}
+		}
+		// Read after the quiet window, so the scan sees what the fork will copy.
+		const records = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }).records as unknown as ReadonlyArray<{ message?: { content?: unknown } }>;
+		const pending = new Set<string>();
+		for (const record of records) {
+			const content = record.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content as Array<{ type?: string; id?: string; tool_use_id?: string }>) {
+				if (block.type === "tool_use" && block.id) pending.add(block.id);
+				else if (block.type === "tool_result" && block.tool_use_id) pending.delete(block.tool_use_id);
+			}
+		}
+		if (pending.size) debug(`post-abort: session ${sessionId.slice(0, 8)} has ${pending.size} tool_use without a result, rebuilding instead of forking`);
+		return records.length > 0 && pending.size === 0;
+	} catch {
+		return false;
 	}
 }
 
@@ -785,7 +892,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 		if (trailingAssistantOnly) {
-			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd });
+			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd, fingerprint: historyFingerprint(priorMessages) });
 			debug(`Case 3: advanced cursor past trailing assistant, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${priorMessages.length}`);
 		} else {
 			debug(`Case 3: resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
@@ -814,6 +921,66 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
+	}
+
+	// FORK after an abort (see forkAfterAbort). pi's history must extend the one the
+	// file was built from; the aborted turn itself is already in the file.
+	// What came after the cursor must be the aborted turn alone: at most its one
+	// user prompt (first), and Claude's own replies and their tool results. A turn
+	// another provider took after the abort is not in the file, so forking would
+	// drop it from Claude's context; rebuild instead.
+	const sinceAbort = sharedSession?.forkAfterAbort && priorMessages.length >= sharedSession.cursor
+		? priorMessages.slice(sharedSession.cursor) as Array<{ role?: string; provider?: string }> : null;
+	const onlyAbortedTurn = sinceAbort !== null && sinceAbort.every((message, index) =>
+		(message.role === "user" && index === 0) || message.role === "toolResult"
+		|| (message.role === "assistant" && message.provider === PROVIDER_ID));
+	if (sinceAbort !== null && !onlyAbortedTurn) {
+		debug(`post-abort: ${sinceAbort.length} message(s) since the abort are not the aborted turn alone, rebuilding instead of forking`);
+	}
+	if (sharedSession && onlyAbortedTurn && ccSessionForkable(sharedSession.sessionId, cwd)) {
+		const forkFrom = sharedSession.sessionId;
+		const sessionId = randomUUID();
+		setSessionStateFor(piSessionId, { sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined, fingerprint: historyFingerprint(priorMessages) });
+		debug(`Case 4 post-abort fork: ${priorMessages.length} total → session ${sessionId.slice(0, 8)} forked from ${forkFrom.slice(0, 8)} (no rebuild)`);
+		debug(`syncResult: path=reuse sessionId=${sessionId} cursor=${priorMessages.length} forked-post-abort`);
+		return { sessionId, forkFrom };
+	}
+
+	// REUSE across processes: no mirror in this process (restart, `pi --continue`,
+	// /reload), but the session link says which CC file this pi session last ran
+	// on and fingerprints the history that file holds. If pi's history is that
+	// history plus at most the trailing assistant reply (the same drift REUSE
+	// accepts above), resume the file as-is. Rebuilding instead rewrites the whole
+	// conversation from pi's copy, which never byte-matches what Claude Code sent,
+	// so the entire history would miss the prompt cache.
+	if (!sharedSession && priorMessages.length > 0) {
+		const link = lookupResumableLink(piSessionId, cwd);
+		if (link) {
+			const { count, hash } = link.fingerprint;
+			const missed = priorMessages.length >= count ? priorMessages.slice(count) : null;
+			const continues = missed !== null &&
+				(missed.length === 0 || (missed.length === 1 && (missed[0] as { role?: string }).role === "assistant"));
+			const matches = continues && historyFingerprint(priorMessages.slice(0, count)).hash === hash;
+			const records = matches ? ccSessionRecords(link.ccSessionId, cwd) : undefined;
+			// The trailing assistant reply is outside the fingerprint (pi appends it
+			// after the query completes). /tree can swap it for another reply to the
+			// same prompt, so it must be the reply the file ends with.
+			// Compared as text, so a reply carrying tool calls (never a turn's final
+			// reply) is not accepted at all.
+			const trailingContent = missed?.length === 1 ? (missed[0] as { content?: unknown }).content : undefined;
+			const trailingHasToolCall = Array.isArray(trailingContent)
+				&& (trailingContent as Array<{ type?: string }>).some((block) => block.type !== "text" && block.type !== "thinking");
+			const trailing = missed?.length === 1 ? (trailingHasToolCall ? "" : textOf(trailingContent)) : undefined;
+			const trailingMatches = trailing === undefined || (trailing !== "" && records !== undefined && lastAssistantText(records) === trailing);
+			const resumable = records !== undefined && trailingMatches;
+			if (resumable) {
+				setSessionStateFor(piSessionId, { sessionId: link.ccSessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined, fingerprint: historyFingerprint(priorMessages) });
+				debug(`Case 3 linked: resuming session ${link.ccSessionId.slice(0, 8)} from a previous process, cursor=${priorMessages.length}`);
+				debug(`syncResult: path=reuse sessionId=${link.ccSessionId} cursor=${priorMessages.length} linked`);
+				return { sessionId: link.ccSessionId };
+			}
+			debug(`Case 2: linked session ${link.ccSessionId.slice(0, 8)} not resumable (${!continues ? `history ${priorMessages.length} vs linked ${count}` : !matches ? "fingerprint differs" : records === undefined ? "session file unreadable" : "last reply differs"}), rebuilding`);
+		}
 	}
 
 	// REBUILD path
@@ -854,7 +1021,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined, fingerprint: historyFingerprint(priorMessages) });
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -885,6 +1052,8 @@ export const __test = {
 		historyRewrittenBySession.clear();
 	},
 	markRebuildForSession,
+	resumeOptions,
+	mapToolArgs,
 	getHistoryRewritten: () => historyRewrittenBySession.size > 0,
 	historyRewrittenBySession,
 	armStaleContexts,
@@ -964,8 +1133,9 @@ function mapToolArgs(
 		if (!(piKey in result)) result[piKey] = value; // first alias wins
 	}
 	// Pi bash has no default timeout; add a safety default
+	// (convert.ts drops it again when replaying the history to Claude Code.)
 	if (toolName.toLowerCase() === "bash" && result.timeout == null) {
-		result.timeout = 120;
+		result.timeout = BASH_DEFAULT_TIMEOUT;
 	}
 	return result;
 }
@@ -1492,6 +1662,8 @@ async function consumeQuery(
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
 			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+			// LOCAL PATCH (pi-limits): live windows for ~/.pi/agent/extensions/statusline.ts.
+			if (info?.unifiedWindows) { try { writeFileSync(join(process.env.HOME ?? "", ".claude/cache/pi-bridge-limits.json"), JSON.stringify({ at_epoch: Math.floor(Date.now() / 1000), windows: info.unifiedWindows })); } catch {} }
 			if (info?.status === "rejected") {
 				// Held so the failure Claude Code sends next can be named as a rate limit.
 				queryCtx.rateLimitRejection = info;
@@ -1585,7 +1757,7 @@ function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null 
 function steerMissedSession(c: QueryContext, text: string): void {
 	c.missedSteer = true;
 	const state = sessionStateFor(c.piSessionId);
-	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true });
+	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forkAfterAbort: false });
 	debug(`provider: steer never reached CC, marked query for rebuild: ${text.slice(0, 60)}`);
 }
 
@@ -1710,7 +1882,7 @@ function discardRewrittenQuery(c: QueryContext): void {
 	// exactly as after an abort. Only this session's mirror: the discarding query
 	// proves its own conversation is the one being rebuilt around.
 	const state = sessionStateFor(c.piSessionId);
-	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forceRotate: true, forkAfterAbort: false });
 	if (c.piSessionId) historyRewrittenBySession.delete(c.piSessionId);
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
@@ -1790,6 +1962,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// turn a full rebuild and a flushed prompt cache.
 		const state = sessionStateFor(resultCtx.piSessionId);
 		if (state) state.cursor = context.messages.length;
+		if (context.messages.length >= resultCtx.latestCursor) resultCtx.latestMessages = context.messages;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1881,6 +2054,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.latestMessages = null;
 	// The served pi session, for rewrite attribution on delivery (issue #101
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
@@ -1903,6 +2077,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// armed rewrite — a sibling pi session's stays armed for its own queries.
 	if (piSessionId) historyRewrittenBySession.delete(piSessionId);
 	const { sessionId: resumeSessionId } = syncResult;
+	const resumeOpts = resumeOptions(syncResult);
+	// Until pi has persisted this turn, the CC file may hold messages pi's history
+	// does not: a process that dies mid-turn must not leave a link a new process
+	// would resume (see turnInFlight).
+	if (resumeSessionId && !syncResult.preserveSharedSession) {
+		const state = sessionStateFor(piSessionId);
+		if (state) setSessionStateFor(piSessionId, { ...state, turnInFlight: true });
+	}
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -2003,14 +2185,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
 			includeGitInstructions: false,
 		},
-		systemPrompt: {
-			type: "preset", preset: "claude_code",
-			append: systemPromptAppend ? systemPromptAppend : undefined,
-		},
+		// LOCAL PATCH (replace-prompt): sends only the projected pi context, dropping Claude
+		// Code's preset, unless CLAUDE_BRIDGE_PROMPT=preset. With no projected context the preset
+		// is kept, never an empty prompt. Backup: ~/.pi/agent/index.ts.bak-bridge-0.9.1-2026-09-30
+		systemPrompt: process.env.CLAUDE_BRIDGE_PROMPT !== "preset" && systemPromptAppend
+			? systemPromptAppend
+			: {
+				type: "preset", preset: "claude_code",
+				append: systemPromptAppend ? systemPromptAppend : undefined,
+			},
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+		...resumeOpts,
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
 	};
@@ -2064,7 +2251,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				// The killed subprocess may flush a late record into this session's
 				// JSONL — its own mirror's next sync must rebuild and rotate.
 				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true, forkAfterAbort: !state.needsRebuild || Boolean(state.forkAfterAbort) });
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
@@ -2094,9 +2281,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				if (sessionId) {
 					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
 					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
+					// Fingerprint the history the CC file now holds: the newest context
+					// this query was handed (the last tool-result delivery's, else the
+					// turn's own). The fingerprint carries its own count, so it does not
+					// depend on which index space the cursor above ended up in.
+					const latest = queryCtx.latestMessages;
+					const source = latest && latest.length >= context.messages.length ? latest : context.messages;
+					const fingerprint = historyFingerprint(nonSystemMessages(source));
 					// A missed steer may precede the first mirror or arrive while this
 					// query is still able to complete. Preserve both rebuild signals.
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild, fingerprint });
 				}
 			}
 
@@ -2114,7 +2308,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			if ((wasAborted || options?.signal?.aborted)) {
 				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true, forkAfterAbort: !state.needsRebuild || Boolean(state.forkAfterAbort) });
 			} else {
 				// Drop this session's mirror: its conversation is in an unknown
 				// state after the error. Other sessions' mirrors stay — one
@@ -2422,7 +2616,7 @@ export default function (pi: ExtensionAPI) {
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
 	//
-	// The options (custom/append/contextFiles/skills/sections) are pi config, stable across a
+	// The options (custom/append/contextFiles/skills) are pi config, stable across a
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
@@ -2432,7 +2626,6 @@ export default function (pi: ExtensionAPI) {
 		appendSystemPrompt?: string;
 		contextFiles?: { path: string; content: string }[];
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
-		sections?: Record<string, string>;
 		selectedTools?: string[];
 	} | undefined) {
 		if (!systemPrompt) return;
@@ -2442,7 +2635,6 @@ export default function (pi: ExtensionAPI) {
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
-			sections: options?.sections,
 		}, source);
 	}
 	pi.on("before_agent_start", (event) => {
@@ -2474,6 +2666,11 @@ export default function (pi: ExtensionAPI) {
 	// next before_agent_start — accepted: a stale skills list beats failing the turn.
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+	pi.on("agent_end", (_event, ctx) => {
+		const piSessionId = ctx.sessionManager.getSessionId();
+		const state = sessionStateFor(piSessionId);
+		if (state?.turnInFlight) setSessionStateFor(piSessionId, { ...state, turnInFlight: false });
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
